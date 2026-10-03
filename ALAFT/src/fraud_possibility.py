@@ -1,131 +1,97 @@
 import numpy as np
 import pandas as pd
-import xgboost as xgb
-from sklearn.model_selection import train_test_split
+from scipy.special import expit
 
-class FraudPossibilityComputer:
 
-    def calculate_delta_ij(self, normal_time, fraud_time):
-        time_diff = abs(normal_time - fraud_time)
-        return 1 / (1 + np.exp(time_diff))
+def temporal_weight(minutes_apart):
+    """delta_ij = 1 / (1 + e^{|t(x_i) - t(f_j)|})"""
+    return expit(-np.abs(minutes_apart))
 
-    def calculate_summation(self, normal_trans, fraud_trans, theta, ks):
-        numerator = 0
-        denominator = 0
 
-        for g in range(-theta, theta + 1):
-            avg_fraud_trans = np.mean([fraud_features[j] for j in range(len(fraud_features)) if j + g >= 0], axis=0)
+class FraudPossibilityCalculator:
+    """Idea 3: fraud possibility of the remaining normal transactions in active lifetime.
 
-            numerator += np.dot(normal_trans, avg_fraud_trans)
+    fps(x_i) = sum_{j in F} M(x_i, f_j),  M = M_o + M_t + M_a + M_c,
+    M_v(x_i, f_j) = delta_ij * sum_g x_i . f^avg_{j+g} / sum_k delta_kj * sum_g x_k . f^avg_{j+g},
+    where g slides from -theta to theta minutes around f_j.
+    """
 
-            for fraud_trans in lst_fraud_trans:
-              denominator += np.dot(fraud_trans, avg_fraud_trans)
-              for k in ks:
-                delta = calculate_delta_ij(k, fraud_trans)
-                denominator += (delta * denominator)
+    def __init__(self, theta=15, batch_size=1024):
+        if not isinstance(theta, int) or theta < 0 or batch_size < 1:
+            raise ValueError("theta must be a nonnegative integer; batch_size must be positive")
+        self.theta = theta
+        self.batch_size = batch_size
 
-        return numerator, denominator
+    def windowed_fraud_means(self, fraud_vectors, fraud_minutes):
+        """sum_{g=-theta}^{theta} f^avg_{j+g}: mean fraud vector between f_j and f_j + g minutes."""
+        total = np.zeros_like(fraud_vectors, dtype=float)
+        order = np.argsort(fraud_minutes, kind="stable")
+        times = fraud_minutes[order]
+        prefix = np.vstack([np.zeros((1, fraud_vectors.shape[1])), np.cumsum(fraud_vectors[order], axis=0, dtype=float)])
+        for g in range(-self.theta, self.theta + 1):
+            lower = fraud_minutes + min(g, 0)
+            upper = fraud_minutes + max(g, 0)
+            left = np.searchsorted(times, lower, side="left")
+            right = np.searchsorted(times, upper, side="right")
+            total += (prefix[right] - prefix[left]) / (right - left)[:, None]
+        return total
 
-    def calculate_fraud_possibility(self, normal_transaction, fraud_transactions, theta):
-        fraud_possibility = 0
+    def correlation_scores(self, view, normal_minutes, fraud_minutes, normal_rows, fraud_rows):
+        """Same column-normalized correlation sum, with bounded pair matrices."""
+        windows = self.windowed_fraud_means(view[fraud_rows], fraud_minutes)
+        scores = np.zeros(len(normal_rows))
+        for fstart in range(0, len(fraud_rows), self.batch_size):
+            ftime = fraud_minutes[fstart:fstart + self.batch_size]
+            vectors = windows[fstart:fstart + self.batch_size]
+            denominator = np.zeros(len(ftime))
+            for nstart in range(0, len(normal_rows), self.batch_size):
+                rows = normal_rows[nstart:nstart + self.batch_size]
+                delta = temporal_weight(normal_minutes[nstart:nstart + len(rows), None] - ftime[None, :])
+                denominator += (delta * (view[rows] @ vectors.T)).sum(axis=0)
+            for nstart in range(0, len(normal_rows), self.batch_size):
+                rows = normal_rows[nstart:nstart + self.batch_size]
+                delta = temporal_weight(normal_minutes[nstart:nstart + len(rows), None] - ftime[None, :])
+                weighted = delta * (view[rows] @ vectors.T)
+                scores[nstart:nstart + len(rows)] += np.divide(weighted, denominator, out=np.zeros_like(weighted), where=denominator > 0).sum(axis=1)
+        return scores
 
-        for fraud_transaction in fraud_transactions:
-            delta_ij = calculate_delta_ij(normal_transaction['timestamp'], fraud_transaction['timestamp'])
+    def temporal_correlation(self, view, normal_minutes, fraud_minutes, normal_rows, fraud_rows):
+        """M_v(x_k, f_j) for every normal x_k and fraud f_j of an active lifetime."""
+        windowed = self.windowed_fraud_means(view[fraud_rows], fraud_minutes)
+        delta = temporal_weight(normal_minutes[:, None] - fraud_minutes[None, :])
+        weighted = delta * (view[normal_rows] @ windowed.T)
+        denominator = weighted.sum(axis=0)
+        return np.divide(weighted, denominator, out=np.zeros_like(weighted), where=denominator > 0)
 
-            numerator, denominator = calculate_summation(
-                normal_transaction['original_features'], fraud_transaction['original_features'], theta
+    def fraud_possibility_scores(self, enriched, y, timestamps, lifetime_ids, remaining):
+        """fps for each remaining normal transaction, NaN elsewhere."""
+        y = np.asarray(y)
+        views = enriched.views()
+        minutes = ((timestamps - timestamps.min()) / pd.Timedelta(minutes=1)).to_numpy()
+        scores = np.full(len(y), np.nan)
+
+        for lifetime in np.unique(lifetime_ids[remaining]):
+            in_lifetime = lifetime_ids == lifetime
+            normal_rows = np.flatnonzero(in_lifetime & (y == 0))
+            fraud_rows = np.flatnonzero(in_lifetime & (y == 1))
+            if len(fraud_rows) == 0:
+                continue
+
+            fps = sum(
+                self.correlation_scores(view, minutes[normal_rows], minutes[fraud_rows], normal_rows, fraud_rows)
+                for view in views.values()
             )
+            is_remaining = remaining[normal_rows]
+            scores[normal_rows[is_remaining]] = fps[is_remaining]
+        return scores
 
-            fraud_possibility += delta_ij * (numerator / max(denominator, 1e-10))
-
-        for fraud_transaction in fraud_transactions:
-            delta_ij = calculate_delta_ij(normal_transaction['timestamp'], fraud_transaction['timestamp'])
-
-            numerator, denominator = calculate_summation(
-                normal_transaction['transaction_features'], fraud_transaction['transaction_features'], theta
-            )
-
-            fraud_possibility += delta_ij * (numerator / max(denominator, 1e-10))
-
-        for fraud_transaction in fraud_transactions:
-            delta_ij = calculate_delta_ij(normal_transaction['timestamp'], fraud_transaction['timestamp'])
-
-            numerator, denominator = calculate_summation(
-                normal_transaction['account_features'], fraud_transaction['account_features'], theta
-            )
-
-            fraud_possibility += delta_ij * (numerator / max(denominator, 1e-10))
-
-        for fraud_transaction in fraud_transactions:
-            delta_ij = calculate_delta_ij(normal_transaction['timestamp'], fraud_transaction['timestamp'])
-
-            numerator, denominator = calculate_summation(
-                normal_transaction['customer_features'], fraud_transaction['customer_features'], theta
-            )
-
-            fraud_possibility += delta_ij * (numerator / max(denominator, 1e-10))
-
-        return fraud_possibility
-
-
-    def add_fraud_possibility_scores(self, df, active_lifetime_ids, theta=5):
-        fraud_df = df[df['label'] == 1]
-        normal_df = df[(df['label'] == 0) & (df['active_lifetime'].isin(active_lifetime))]
-
-        fraud_transactions = fraud_df.to_dict('records')
-        normal_transactions = normal_df.to_dict('records')
-
-        fraud_possibilities = []
-        for normal_transaction in normal_transactions:
-            score = calculate_fraud_possibility(
-                normal_transaction, fraud_transactions, theta
-            )
-            fraud_possibilities.append(score)
-
-        normal_df['fraud_possibility'] = fraud_possibilities
-        return pd.concat([normal_df, fraud_df], ignore_index=True)
-
-
-    def weighted_logloss(self, preds, dtrain):
-        labels = dtrain.get_label()
-        weights = dtrain.get_weight()
-        preds = 1 / (1 + np.exp(-preds))
-
-        grad = weights * (preds - labels)
-        hess = weights * preds * (1 - preds)
-
-        return grad, hess
-
-
-    def train_xgboost_with_fraud_possibility(self, df):
-        features = df.drop(columns=['label', 'fraud_possibility'])
-        target = df['label']
-        weights = df['fraud_possibility']
-
-        X_train, X_test, y_train, y_test, w_train, w_test = train_test_split(
-            features, target, weights, test_size=0.2, random_state=42
-        )
-
-        dtrain = xgb.DMatrix(X_train, label=y_train, weight=w_train)
-        dtest = xgb.DMatrix(X_test, label=y_test)
-
-        params = {
-            'max_depth': 6,
-            'eta': 0.1,
-            'objective': 'binary:logistic',
-            'eval_metric': 'logloss'
-        }
-
-        eval_results = {}
-
-        model = xgb.train(
-            params,
-            dtrain,
-            num_boost_round=100,
-            obj=weighted_logloss,
-            evals=[(dtrain, 'train'), (dtest, 'test')],
-            evals_result=eval_results,
-            verbose_eval=True
-        )
-
-        return model, eval_results, pd.DataFrame(dtrain), pd.DataFrame(dtest)
+    def fraud_possibility(self, enriched, y, timestamps, lifetime_ids, remaining):
+        """Fraud possibility in [0, 1]: min-max normalized fps of the remaining normal transactions."""
+        scores = self.fraud_possibility_scores(enriched, y, timestamps, lifetime_ids, remaining)
+        self.raw_scores_ = scores.copy()
+        known = ~np.isnan(scores)
+        if not known.any():
+            return scores
+        low, high = scores[known].min(), scores[known].max()
+        scores[known] = (scores[known] - low) / (high - low) if high > low else (0.5 if high > 0 else 0.0)
+        return scores
